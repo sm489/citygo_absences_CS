@@ -1,5 +1,15 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+-import { useState, useEffect, useMemo, useRef } from "react";
 import { Calendar, Clock, Trash2, AlertCircle, Loader2, HandHelping, X, CheckCircle2, Pencil, Save, Settings, ArrowLeft, Archive, Repeat, Plus, Users, ListTodo, BarChart3, ArrowLeftRight, Utensils, Info, Eye, EyeOff } from "lucide-react";
+import {
+  signUp,
+  signIn,
+  signOut,
+  requestPasswordReset,
+  updatePassword,
+  getCurrentSession,
+  getCurrentProfile,
+  onAuthStateChange,
+} from "./authLayer";
 
 function formatDateLong(iso) {
   const d = new Date(iso + "T00:00:00");
@@ -460,50 +470,37 @@ export default function AbsenceTracker() {
   }
   const [showPlanningInfo, setShowPlanningInfo] = useState(false);
 
-  // Comptes utilisateurs (email + mot de passe), stockés dans window.storage (partagé).
-  // ⚠️ Limite honnête : sans vrai backend, ceci reste une simulation. Le "hash" ci-dessous
-  // n'est pas une fonction cryptographique sécurisée, juste un brouillage basique — et comme
-  // les données partagées d'un artefact sont lisibles par tout utilisateur, ça n'offre pas
-  // une vraie confidentialité. Pas d'envoi d'email réel non plus : "mot de passe oublié"
-  // affiche le code de réinitialisation à l'écran au lieu de l'envoyer par email, faute de
-  // service d'envoi disponible dans cet environnement.
-  const ADMIN_EMAILS = ["sm@citygo.me", "cc@citygo.me", "mbu@citygo.me"];
-  const ACCOUNT_DOMAIN = "citygo.me";
-
-  function simpleHash(str) {
-    let hash = 5381;
-    for (let i = 0; i < str.length; i++) hash = ((hash << 5) + hash + str.charCodeAt(i)) | 0;
-    return (hash >>> 0).toString(16);
-  }
-
-  const [accounts, setAccounts] = useState(null); // { [email]: { passwordHash, resetCode, resetExpiry } } | null
-  const [authUser, setAuthUser] = useState(null); // { email } | null
+  // Authentification réelle via Supabase Auth (remplace l'ancien système "fait
+  // main" : mots de passe hashés côté serveur, sessions gérées automatiquement,
+  // vrais emails envoyés pour la réinitialisation du mot de passe).
+  const [authUser, setAuthUser] = useState(null); // { email, isAdmin } | null
+  const [checkingSession, setCheckingSession] = useState(true);
 
   useEffect(() => {
     (async () => {
-      if (!window.storage) {
-        setAccounts({});
-        return;
+      // Si la personne arrive depuis le lien "mot de passe oublié" reçu par email,
+      // Supabase la reconnecte automatiquement et on affiche l'écran "nouveau mot de passe".
+      if (window.location.hash.includes("type=recovery")) {
+        setAuthView("reset");
       }
-      try {
-        const res = await window.storage.get("user-accounts", true);
-        setAccounts(res && res.value ? JSON.parse(res.value) : {});
-      } catch (e) {
-        setAccounts({});
+      const session = await getCurrentSession();
+      if (session) {
+        const profile = await getCurrentProfile();
+        setAuthUser(profile);
       }
+      setCheckingSession(false);
     })();
-  }, []);
 
-  async function persistAccounts(next) {
-    setAccounts(next);
-    if (window.storage) {
-      try {
-        await window.storage.set("user-accounts", JSON.stringify(next), true);
-      } catch (e) {
-        console.error("Erreur de sauvegarde des comptes:", e);
+    const subscription = onAuthStateChange(async (session) => {
+      if (session) {
+        const profile = await getCurrentProfile();
+        setAuthUser(profile);
+      } else {
+        setAuthUser(null);
       }
-    }
-  }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
   // Vue de la page de connexion : "login" | "signup" | "forgot" | "reset"
   const [authView, setAuthView] = useState("login");
@@ -512,39 +509,12 @@ export default function AbsenceTracker() {
 
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
-  const [rememberMe, setRememberMe] = useState(false);
-  const [checkingSession, setCheckingSession] = useState(true);
-
-  // Au chargement, si une session "Rester connecté" valide (< 30 jours) existe, on reconnecte
-  // automatiquement la personne sans lui redemander son email/mot de passe.
-  useEffect(() => {
-    (async () => {
-      if (!window.storage) {
-        setCheckingSession(false);
-        return;
-      }
-      try {
-        const res = await window.storage.get("remember-session", false);
-        if (res && res.value) {
-          const session = JSON.parse(res.value);
-          if (session.email && session.expiresAt > Date.now()) {
-            setAuthUser({ email: session.email });
-          }
-        }
-      } catch (e) {
-        // pas de session enregistrée
-      } finally {
-        setCheckingSession(false);
-      }
-    })();
-  }, []);
 
   const [signupEmail, setSignupEmail] = useState("");
   const [signupPassword, setSignupPassword] = useState("");
   const [signupConfirm, setSignupConfirm] = useState("");
 
   const [forgotEmail, setForgotEmail] = useState("");
-  const [resetCodeInput, setResetCodeInput] = useState("");
   const [resetNewPassword, setResetNewPassword] = useState("");
   const [resetNewPasswordConfirm, setResetNewPasswordConfirm] = useState("");
 
@@ -554,23 +524,8 @@ export default function AbsenceTracker() {
   const [showSignupConfirm, setShowSignupConfirm] = useState(false);
   const [showResetNewPassword, setShowResetNewPassword] = useState(false);
   const [showResetNewPasswordConfirm, setShowResetNewPasswordConfirm] = useState(false);
-  const [resetTargetEmail, setResetTargetEmail] = useState("");
 
-  function isValidCompanyEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.toLowerCase().endsWith(`@${ACCOUNT_DOMAIN}`);
-  }
-
-  function handleSignup() {
-    if (!accounts) return;
-    const email = signupEmail.trim().toLowerCase();
-    if (!isValidCompanyEmail(email)) {
-      setAuthError(`Utilisez une adresse email @${ACCOUNT_DOMAIN}.`);
-      return;
-    }
-    if (accounts[email]) {
-      setAuthError("Un compte existe déjà avec cette adresse email.");
-      return;
-    }
+  async function handleSignup() {
     if (signupPassword.length < 6) {
       setAuthError("Le mot de passe doit faire au moins 6 caractères.");
       return;
@@ -579,78 +534,63 @@ export default function AbsenceTracker() {
       setAuthError("Les deux mots de passe ne correspondent pas.");
       return;
     }
-    const next = { ...accounts, [email]: { passwordHash: simpleHash(signupPassword) } };
-    persistAccounts(next);
+    const result = await signUp(signupEmail.trim().toLowerCase(), signupPassword);
+    if (result.error) {
+      setAuthError(result.error);
+      return;
+    }
     setAuthError("");
-    setAuthUser({ email });
-    setSignupEmail("");
     setSignupPassword("");
     setSignupConfirm("");
+    if (result.data.session) {
+      // Confirmation par email désactivée dans les réglages Supabase : connecté directement.
+      const profile = await getCurrentProfile();
+      setAuthUser(profile);
+    } else {
+      // Cas normal : un email de confirmation vient d'être envoyé.
+      setAuthInfo("Compte créé ! Vérifiez votre boîte email pour confirmer votre adresse avant de vous connecter.");
+      setAuthView("login");
+    }
   }
 
-  function handleLogin() {
-    if (!accounts) return;
-    const email = loginEmail.trim().toLowerCase();
-    if (!email || !loginPassword) {
+  async function handleLogin() {
+    if (!loginEmail || !loginPassword) {
       setAuthError("Renseignez votre email et votre mot de passe.");
       return;
     }
-    const account = accounts[email];
-    if (!account || account.passwordHash !== simpleHash(loginPassword)) {
-      setAuthError("Email ou mot de passe incorrect.");
+    const result = await signIn(loginEmail.trim().toLowerCase(), loginPassword);
+    if (result.error) {
+      setAuthError(result.error);
       return;
     }
     setAuthError("");
-    setAuthUser({ email });
     setLoginPassword("");
-    if (rememberMe && window.storage) {
-      const session = { email, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
-      window.storage.set("remember-session", JSON.stringify(session), false).catch(() => {});
-    }
+    const profile = await getCurrentProfile();
+    setAuthUser(profile);
   }
 
-  function handleLogout() {
+  async function handleLogout() {
+    await signOut();
     setAuthUser(null);
     setLoginEmail("");
     setLoginPassword("");
-    setRememberMe(false);
     setAuthView("login");
     setAuthError("");
     setAuthInfo("");
-    if (window.storage) {
-      window.storage.delete("remember-session", false).catch(() => {});
-    }
   }
 
-  function handleRequestReset() {
-    if (!accounts) return;
-    const email = forgotEmail.trim().toLowerCase();
-    const account = accounts[email];
-    if (!account) {
-      setAuthError("Aucun compte n'existe avec cette adresse email.");
+  async function handleRequestReset() {
+    const result = await requestPasswordReset(forgotEmail.trim().toLowerCase());
+    if (result.error) {
+      setAuthError(result.error);
       return;
     }
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    const next = {
-      ...accounts,
-      [email]: { ...account, resetCode: code, resetExpiry: Date.now() + 15 * 60 * 1000 },
-    };
-    persistAccounts(next);
-    setResetTargetEmail(email);
     setAuthError("");
-    setAuthInfo(
-      `Aucun envoi d'email réel n'est possible dans cet environnement de démonstration. Voici votre code de réinitialisation à usage unique (valable 15 minutes) : ${code}`
-    );
-    setAuthView("reset");
+    setAuthInfo("Un email avec un lien de réinitialisation vient d'être envoyé, s'il existe un compte avec cette adresse.");
+    setAuthView("login");
   }
 
-  function handleResetPassword() {
-    if (!accounts) return;
-    const account = accounts[resetTargetEmail];
-    if (!account || account.resetCode !== resetCodeInput.trim() || Date.now() > (account.resetExpiry || 0)) {
-      setAuthError("Code incorrect ou expiré.");
-      return;
-    }
+  async function handleResetPassword() {
     if (resetNewPassword.length < 6) {
       setAuthError("Le mot de passe doit faire au moins 6 caractères.");
       return;
@@ -659,21 +599,20 @@ export default function AbsenceTracker() {
       setAuthError("Les deux mots de passe ne correspondent pas.");
       return;
     }
-    const next = {
-      ...accounts,
-      [resetTargetEmail]: { passwordHash: simpleHash(resetNewPassword) },
-    };
-    persistAccounts(next);
+    const result = await updatePassword(resetNewPassword);
+    if (result.error) {
+      setAuthError(result.error);
+      return;
+    }
     setAuthError("");
-    setAuthInfo("Mot de passe mis à jour. Vous pouvez vous connecter.");
-    setAuthView("login");
-    setLoginEmail(resetTargetEmail);
-    setResetCodeInput("");
+    setAuthInfo("Mot de passe mis à jour. Vous êtes connecté(e).");
     setResetNewPassword("");
     setResetNewPasswordConfirm("");
+    const profile = await getCurrentProfile();
+    setAuthUser(profile);
   }
 
-  const isAdmin = !!authUser && ADMIN_EMAILS.includes(authUser.email.toLowerCase());
+  const isAdmin = !!authUser?.isAdmin;
   const canEditPlanning = isAdmin;
   const canEditArchive = isAdmin;
 
@@ -1853,7 +1792,7 @@ export default function AbsenceTracker() {
             <p className="text-xs font-semibold tracking-widest text-violet-600 uppercase">Service client</p>
           </div>
 
-          {accounts === null || checkingSession ? (
+          {checkingSession ? (
             <div className="flex items-center gap-2 text-slate-400 text-sm py-8 justify-center">
               <Loader2 className="w-4 h-4 animate-spin" /> Chargement…
             </div>
@@ -1870,7 +1809,7 @@ export default function AbsenceTracker() {
               </h1>
               <p className="text-xs text-slate-400 mb-5">
                 {authView === "login" && ""}
-                {authView === "signup" && `Créez votre compte avec votre adresse email @${ACCOUNT_DOMAIN}.`}
+                {authView === "signup" && "Créez votre compte avec votre adresse email professionnelle."}
                 {authView === "forgot" && "Recevez un code pour réinitialiser votre mot de passe."}
                 {authView === "reset" && "Saisissez le code reçu et votre nouveau mot de passe."}
               </p>
@@ -1920,18 +1859,9 @@ export default function AbsenceTracker() {
                       {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
-                  <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={rememberMe}
-                      onChange={(ev) => setRememberMe(ev.target.checked)}
-                      className="w-4 h-4 rounded border-slate-300 text-violet-600 focus:ring-violet-500"
-                    />
-                    <span className="text-xs text-slate-600">Rester connecté pendant 30 jours</span>
-                  </label>
                   <button
                     onClick={handleLogin}
-                    className="w-full bg-violet-600 hover:bg-violet-700 text-white font-medium py-2.5 rounded-lg text-sm transition-colors"
+                    className="w-full bg-violet-600 hover:bg-violet-700 text-white font-medium py-2.5 rounded-lg text-sm transition-colors mt-4"
                   >
                     Se connecter
                   </button>
@@ -2050,13 +1980,6 @@ export default function AbsenceTracker() {
 
               {authView === "reset" && (
                 <>
-                  <label className="block text-xs font-medium text-slate-700 mb-1.5">Code reçu</label>
-                  <input
-                    value={resetCodeInput}
-                    onChange={(ev) => setResetCodeInput(ev.target.value)}
-                    placeholder="123456"
-                    className="w-full px-3 py-2.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-violet-500 text-sm mb-3"
-                  />
                   <label className="block text-xs font-medium text-slate-700 mb-1.5">Nouveau mot de passe</label>
                   <div className="relative mb-3">
                     <input
@@ -4228,3 +4151,4 @@ export default function AbsenceTracker() {
     </div>
   );
 }
+
